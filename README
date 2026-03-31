@@ -1,7 +1,11 @@
 MMC tools (mmc-utils)
 =====================
 
-mmc-utils is a tool for configuring MMC storage devices from userspace.
+mmc-utils is a tool for configuring MMC storage devices from userspace.  I've
+put this here so I'll have it when I need it, with patches for CMD42 integrated.
+Also kernel patch to allow for creating device nodes and doing ioctls even
+when a locked card is inserted.  Spams a lot of errors to dmesg, but gets the
+job done.
 
 Contribution guidelines
 -----------------------

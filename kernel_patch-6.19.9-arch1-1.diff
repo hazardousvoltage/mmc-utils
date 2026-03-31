@@ -1,0 +1,214 @@
+--- a/linux-6.19.9/drivers/mmc/core/block.c
++++ b/linux-6.19.9/drivers/mmc/core/block.c
+@@ -518,6 +518,15 @@
+ 	cmd.arg = idata->ic.arg;
+ 	cmd.flags = idata->ic.flags;
+ 
++	/*
++	 * CMD42 (LOCK_UNLOCK) is specified as an adtc command with R1b.
++	 * Some userspace tools pass R1, which can break host busy handling.
++	 */
++	if (cmd.opcode == MMC_LOCK_UNLOCK &&
++	    (cmd.flags & MMC_RSP_R1B) != MMC_RSP_R1B) {
++		cmd.flags = MMC_RSP_R1B | MMC_CMD_ADTC;
++	}
++
+ 	if (idata->buf_bytes) {
+ 		data.sg = &sg;
+ 		data.sg_len = 1;
+@@ -589,6 +598,16 @@
+ 		}
+ 	}
+ 
++	/*
++	 * For CMD42 (LOCK_UNLOCK), some hosts report -EINVAL while the card is
++	 * still locked, even when the response only signals CARD_IS_LOCKED.
++	 * Allow this specific case so userspace can issue unlock via ioctl.
++	 */
++	if (cmd.error == -EINVAL && cmd.opcode == MMC_LOCK_UNLOCK &&
++	    (R1_STATUS(cmd.resp[0]) & ~R1_CARD_IS_LOCKED) == 0) {
++		cmd.error = 0;
++	}
++
+ 	if (cmd.error) {
+ 		dev_err(mmc_dev(card->host), "%s: cmd error %d\n",
+ 						__func__, cmd.error);
+@@ -658,6 +677,14 @@
+ 					  &mmc_blk_busy_cb, &cb_data);
+ 
+ 		idata->ic.response[0] = cb_data.status;
++	}
++
++	/* Keep cached lock state in sync with card status for ioctl unlock flow */
++	if (!mmc_send_status(card, &cmd.resp[0])) {
++		if (cmd.resp[0] & R1_CARD_IS_LOCKED)
++			mmc_card_set_locked(card);
++		else
++			mmc_card_clr_locked(card);
+ 	}
+ 
+ 	return err;
+@@ -2411,13 +2438,34 @@
+ 	struct mmc_blk_data *md = mq->blkdata;
+ 	struct mmc_card *card = md->queue.card;
+ 	struct mmc_host *host = card->host;
++	enum mmc_issue_type issue_type;
+ 	int ret;
++
++	issue_type = mmc_issue_type(mq, req);
++
++	/*
++	 * Keep the block node available for ioctl-based unlock, but fail
++	 * data path I/O quickly while the card is locked.
++	 */
++	if (mmc_card_locked(card)) {
++		switch (req_op(req)) {
++		case REQ_OP_READ:
++		case REQ_OP_WRITE:
++		case REQ_OP_DISCARD:
++		case REQ_OP_SECURE_ERASE:
++		case REQ_OP_WRITE_ZEROES:
++		case REQ_OP_FLUSH:
++			return MMC_REQ_FAILED_TO_START;
++		default:
++			break;
++		}
++	}
+ 
+ 	ret = mmc_blk_part_switch(card, md->part_type);
+ 	if (ret)
+ 		return MMC_REQ_FAILED_TO_START;
+ 
+-	switch (mmc_issue_type(mq, req)) {
++	switch (issue_type) {
+ 	case MMC_ISSUE_SYNC:
+ 		ret = mmc_blk_wait_for_idle(mq, host);
+ 		if (ret)
+--- a/linux-6.19.9/drivers/mmc/core/card.h
++++ b/linux-6.19.9/drivers/mmc/core/card.h
+@@ -32,6 +32,13 @@
+ #define mmc_card_removed(c)	((c) && ((c)->state & MMC_CARD_REMOVED))
+ #define mmc_card_suspended(c)	((c)->state & MMC_STATE_SUSPENDED)
+ #define mmc_card_ult_capacity(c) ((c)->state & MMC_CARD_SDUC)
++
++/* Card locked state (SD R1: CARD_IS_LOCKED) */
++#define MMC_STATE_LOCKED	(1<<7)
++
++#define mmc_card_locked(c)    ((c)->state & MMC_STATE_LOCKED)
++#define mmc_card_set_locked(c) ((c)->state |= MMC_STATE_LOCKED)
++#define mmc_card_clr_locked(c) ((c)->state &= ~MMC_STATE_LOCKED)
+ 
+ #define mmc_card_set_present(c)	((c)->state |= MMC_STATE_PRESENT)
+ #define mmc_card_set_readonly(c) ((c)->state |= MMC_STATE_READONLY)
+--- a/linux-6.19.9/drivers/mmc/core/sd.c
++++ b/linux-6.19.9/drivers/mmc/core/sd.c
+@@ -1424,6 +1424,7 @@
+ 	u32 cid[4];
+ 	u32 rocr = 0;
+ 	bool v18_fixup_failed = false;
++	bool locked_card = false;
+ 
+ 	WARN_ON(!host->claimed);
+ retry:
+@@ -1497,9 +1498,59 @@
+ 	/* Apply quirks prior to card setup */
+ 	mmc_fixup_device(card, mmc_sd_fixups);
+ 
+-	err = mmc_sd_setup_card(host, card, oldcard != NULL);
++
++	u32 card_status;
++
++	err = mmc_send_status(card, &card_status);
+ 	if (err)
+ 		goto free_card;
++
++	if (card_status & R1_CARD_IS_LOCKED) {
++		/* Record locked state so block layer can adapt behavior */
++		mmc_card_set_locked(card);
++		locked_card = true;
++	} else {
++		mmc_card_clr_locked(card);
++	}
++
++	err = mmc_sd_setup_card(host, card, oldcard != NULL);
++	if (err) {
++		if (!locked_card)
++			goto free_card;
++
++		err = 0;
++	}
++
++	if (locked_card) {
++		/*
++		 * For locked cards, keep probing permissive but still attempt
++		 * transfer-mode setup that may be required for CMD42 unlock.
++		 */
++		err = mmc_sd_switch_hs(card);
++		if (err > 0)
++			mmc_set_timing(card->host, MMC_TIMING_SD_HS);
++
++		mmc_set_clock(host, mmc_sd_get_max_clock(card));
++
++		if (host->ios.timing == MMC_TIMING_SD_HS &&
++		    host->ops->prepare_sd_hs_tuning) {
++			err = host->ops->prepare_sd_hs_tuning(host, card);
++		}
++
++		if ((host->caps & MMC_CAP_4_BIT_DATA) &&
++		    (card->scr.bus_widths & SD_SCR_BUS_WIDTH_4)) {
++			err = mmc_app_set_bus_width(card, MMC_BUS_WIDTH_4);
++			if (!err)
++				mmc_set_bus_width(host, MMC_BUS_WIDTH_4);
++		}
++
++		if (host->ios.timing == MMC_TIMING_SD_HS &&
++		    host->ops->execute_sd_hs_tuning) {
++			err = host->ops->execute_sd_hs_tuning(host, card);
++		}
++
++		goto cont;
++	}
+ 
+ 	/*
+ 	 * If the card has not been power cycled, it may still be using 1.8V
+--- a/linux-6.19.9/drivers/mmc/host/rtsx_pci_sdmmc.c
++++ b/linux-6.19.9/drivers/mmc/host/rtsx_pci_sdmmc.c
+@@ -381,6 +381,7 @@
+ 	int timeout)
+ {
+ 	struct rtsx_pcr *pcr = host->pcr;
++	u8 cfg2;
+ 	int err;
+ 
+ 	dev_dbg(sdmmc_dev(host), "%s: SD/MMC CMD %d, arg = 0x%08x\n",
+@@ -404,9 +405,11 @@
+ 
+ 	rtsx_pci_init_cmd(pcr);
+ 	sd_cmd_set_data_len(pcr, 1, byte_cnt);
+-	rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, SD_CFG2, 0xFF,
+-		SD_CALCULATE_CRC7 | SD_CHECK_CRC16 |
+-		SD_NO_WAIT_BUSY_END | SD_CHECK_CRC7 | SD_RSP_LEN_0);
++	cfg2 = SD_CALCULATE_CRC7 | SD_CHECK_CRC16 |
++		SD_NO_WAIT_BUSY_END | SD_CHECK_CRC7 | SD_RSP_LEN_0;
++	if (cmd->opcode == MMC_LOCK_UNLOCK)
++		cfg2 &= ~SD_NO_WAIT_BUSY_END;
++	rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, SD_CFG2, 0xFF, cfg2);
+ 	rtsx_pci_add_cmd(pcr, WRITE_REG_CMD, SD_TRANSFER, 0xFF,
+ 			SD_TRANSFER_START | SD_TM_AUTO_WRITE_3);
+ 	rtsx_pci_add_cmd(pcr, CHECK_REG_CMD, SD_TRANSFER,
+@@ -602,10 +605,14 @@
+ 
+ 		sg_copy_from_buffer(data->sg, data->sg_len, buf, data->blksz);
+ 	} else {
++		int wr_timeout = 200;
++
+ 		sg_copy_to_buffer(data->sg, data->sg_len, buf, data->blksz);
++		if (cmd->opcode == MMC_LOCK_UNLOCK)
++			wr_timeout = 3000;
+ 
+ 		cmd->error = sd_write_data(host, cmd, (u16)data->blksz, buf,
+-				data->blksz, 200);
++				data->blksz, wr_timeout);
+ 	}
+ 
+ 	kfree(buf);

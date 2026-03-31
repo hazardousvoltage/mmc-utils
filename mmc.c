@@ -270,6 +270,17 @@ static struct Command commands[] = {
 		"be 1.",
 	NULL
 	},
+	{ do_lock_unlock, -3,
+	"cmd42", "<password> " "<parameter> " "<device>\n"
+		"Usage: mmc cmd42 <password> <s|c|l|u|e> <device>\n"
+		"s\tset password\n"
+		"c\tclear password\n"
+		"l\tlock\n"
+		"sl\tset password and lock\n"
+		"u\tunlock\n"
+		"e\tforce erase\n",
+	NULL
+	},
 	{ do_softreset, -1,
 	  "softreset", "<device>\n"
 	  "Issues a CMD0 softreset, e.g. for testing if hardware reset for UHS works",
